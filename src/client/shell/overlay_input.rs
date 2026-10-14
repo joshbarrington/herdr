@@ -882,14 +882,22 @@ impl ClientShellState {
             return;
         }
 
-        if matches!(self.overlay, Some(ClientShellOverlay::ConfirmClose(_))) {
+        if let Some(ClientShellOverlay::ConfirmClose(confirm)) = &self.overlay {
             if key.code == KeyCode::Enter {
                 self.accept_close_confirmation(outcome);
             } else if key.code == KeyCode::Esc {
+                if matches!(
+                    confirm.request,
+                    ClientCloseRequest::Workspace {
+                        implied_by: None,
+                        ..
+                    }
+                ) {
+                    self.mode = ClientShellMode::Navigate;
+                    self.navigate_workspace_id = self.focused_navigation_target();
+                    self.reveal_navigation_workspace = true;
+                }
                 self.overlay = None;
-                self.mode = ClientShellMode::Navigate;
-                self.navigate_workspace_id = self.focused_navigation_target();
-                self.reveal_navigation_workspace = true;
                 outcome.repaint = true;
             }
             return;
@@ -1021,60 +1029,64 @@ impl ClientShellState {
         );
     }
 
-    pub(super) fn request_pane_close(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
-        let target = self.snapshot.as_deref().and_then(|snapshot| {
-            let pane = snapshot.panes.iter().find(|pane| pane.pane_id == pane_id)?;
-            let tab = snapshot
-                .tabs
-                .iter()
-                .find(|tab| tab.tab_id == pane.tab_id && tab.workspace_id == pane.workspace_id)?;
-            (self.config.confirm_close
-                && !snapshot
-                    .panes
-                    .iter()
-                    .any(|other| other.tab_id == tab.tab_id && other.pane_id != pane_id)
-                && !snapshot.tabs.iter().any(|other| {
-                    other.workspace_id == tab.workspace_id && other.tab_id != tab.tab_id
-                }))
-            .then(|| (tab.workspace_id.clone(), tab.tab_id.clone()))
-        });
-        if let Some((workspace_id, tab_id)) = target {
-            if self.open_close_confirmation(workspace_id, Some(tab_id), None) {
-                if let Some(ClientShellOverlay::ConfirmClose(confirm)) = self.overlay.as_mut() {
-                    if let Some(target) = confirm.tab_target.as_mut() {
-                        target.pane_id = Some(pane_id);
-                    }
-                }
-                outcome.repaint = true;
-                return;
-            }
-        }
-        self.push_endpoint_method(
-            crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget { pane_id }),
-            outcome,
-        );
+    pub(super) fn request_tab_close(&mut self, tab_id: String, outcome: &mut ClientShellInput) {
+        self.request_scoped_close(ClientCloseScope::Tab { tab_id }, outcome);
     }
 
-    pub(super) fn request_tab_close(&mut self, tab_id: String, outcome: &mut ClientShellInput) {
-        let workspace_id = self.snapshot.as_deref().and_then(|snapshot| {
-            let target = snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id)?;
-            (self.config.confirm_close
-                && !snapshot
-                    .tabs
-                    .iter()
-                    .any(|tab| tab.workspace_id == target.workspace_id && tab.tab_id != tab_id))
-            .then(|| target.workspace_id.clone())
-        });
-        if let Some(workspace_id) = workspace_id {
-            if self.open_close_confirmation(workspace_id, Some(tab_id.clone()), None) {
-                outcome.repaint = true;
-                return;
-            }
+    pub(super) fn request_pane_close(&mut self, pane_id: String, outcome: &mut ClientShellInput) {
+        self.request_scoped_close(ClientCloseScope::Pane { pane_id }, outcome);
+    }
+
+    /// Closing a workspace's last tab or pane closes the workspace, so it gets
+    /// the workspace confirmation; otherwise only stopping an agent asks first.
+    fn request_scoped_close(&mut self, scope: ClientCloseScope, outcome: &mut ClientShellInput) {
+        if !self.config.confirm_close {
+            self.push_endpoint_method(scope.into_method(), outcome);
+            return;
         }
-        self.push_endpoint_method(
-            crate::api::schema::Method::TabClose(crate::api::schema::TabTarget { tab_id }),
-            outcome,
-        );
+        let closed_workspace = self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| scope.closed_workspace(snapshot))
+            .map(str::to_owned);
+        let confirming_workspace = closed_workspace.is_some_and(|workspace_id| {
+            self.open_close_confirmation(workspace_id, Some(scope.clone()), None)
+        });
+        if confirming_workspace || self.open_agent_close_confirmation(&scope) {
+            outcome.repaint = true;
+            return;
+        }
+        self.push_endpoint_method(scope.into_method(), outcome);
+    }
+
+    /// Closing a pane stops its processes, so ask first when the close would
+    /// stop a detected agent.
+    fn open_agent_close_confirmation(&mut self, scope: &ClientCloseScope) -> bool {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return false;
+        };
+        let Some((workspace_id, subject)) = scope.locate(snapshot) else {
+            return false;
+        };
+        let agents = snapshot
+            .agents
+            .iter()
+            .filter(|agent| scope.covers(&agent.pane_id, &agent.tab_id));
+        let Some(stopped) = agents_stopped_text(agents) else {
+            return false;
+        };
+        let detail = format!("{subject} — {stopped}");
+        let Some(target) = self.scoped_target(scope.clone(), workspace_id) else {
+            return false;
+        };
+        self.overlay = Some(ClientShellOverlay::ConfirmClose(
+            ClientConfirmCloseOverlay {
+                request: ClientCloseRequest::Scoped(target),
+                title: format!("Close {}?", scope.noun()),
+                detail,
+            },
+        ));
+        true
     }
 
     pub(super) fn accept_close_confirmation(&mut self, outcome: &mut ClientShellInput) {
@@ -1082,42 +1094,43 @@ impl ClientShellState {
             return;
         };
         outcome.repaint = true;
-        let method = if let Some(target) = confirm.tab_target {
-            if target.workspace.endpoint_id != self.active_endpoint_id
-                || !self.navigation_target_valid(&target.workspace)
-                || !self.snapshot.as_deref().is_some_and(|snapshot| {
-                    snapshot.tabs.iter().any(|tab| {
-                        tab.tab_id == target.tab_id
-                            && tab.workspace_id == target.workspace.workspace_id
-                    })
-                })
-                || target.pane_id.as_ref().is_some_and(|pane_id| {
-                    !self.snapshot.as_deref().is_some_and(|snapshot| {
-                        snapshot.panes.iter().any(|pane| {
-                            pane.pane_id == *pane_id
-                                && pane.tab_id == target.tab_id
-                                && pane.workspace_id == target.workspace.workspace_id
+        let method = match confirm.request {
+            ClientCloseRequest::Workspace {
+                workspace_id,
+                close_group,
+                implied_by,
+            } => {
+                // The group close is only implied while the tab or pane is
+                // still the workspace's last one.
+                if let Some(target) = implied_by {
+                    let still_last = self.snapshot.as_deref().is_some_and(|snapshot| {
+                        target.scope.closed_workspace(snapshot) == Some(workspace_id.as_str())
+                    });
+                    if !self.close_target_current(&target, still_last) {
+                        return;
+                    }
+                }
+                crate::api::schema::Method::WorkspaceClose(
+                    crate::api::schema::WorkspaceCloseParams {
+                        workspace_id,
+                        close_group,
+                    },
+                )
+            }
+            ClientCloseRequest::Scoped(target) => {
+                let still_present = self.snapshot.as_deref().is_some_and(|snapshot| {
+                    target
+                        .scope
+                        .locate(snapshot)
+                        .is_some_and(|(workspace_id, _)| {
+                            workspace_id == target.workspace.workspace_id
                         })
-                    })
-                })
-            {
-                self.receive_endpoint_unavailable(
-                    "Close target changed; try closing it again".into(),
-                );
-                return;
+                });
+                if !self.close_target_current(&target, still_present) {
+                    return;
+                }
+                target.scope.into_method()
             }
-            if let Some(pane_id) = target.pane_id {
-                crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget { pane_id })
-            } else {
-                crate::api::schema::Method::TabClose(crate::api::schema::TabTarget {
-                    tab_id: target.tab_id,
-                })
-            }
-        } else {
-            crate::api::schema::Method::WorkspaceClose(crate::api::schema::WorkspaceCloseParams {
-                workspace_id: confirm.workspace_id,
-                close_group: confirm.close_group,
-            })
         };
         self.push_endpoint_method(method, outcome);
     }
@@ -1129,7 +1142,7 @@ impl ClientShellState {
     fn open_close_confirmation(
         &mut self,
         workspace_id: String,
-        tab_id: Option<String>,
+        via: Option<ClientCloseScope>,
         close_group: Option<bool>,
     ) -> bool {
         let Some(snapshot) = self.snapshot.as_deref() else {
@@ -1166,23 +1179,6 @@ impl ClientShellState {
             })
             .unwrap_or_else(|| vec![workspace]);
         let closes_group = group.len() > 1;
-        // Keep parent-group tab closes on the existing server confirmation path.
-        if tab_id.is_some() && closes_group {
-            return false;
-        }
-        let tab_target = if let Some(tab_id) = tab_id {
-            let Some(workspace) = self.navigation_target(&self.active_endpoint_id, &workspace_id)
-            else {
-                return false;
-            };
-            Some(ClientTabCloseConfirmation {
-                tab_id,
-                workspace,
-                pane_id: None,
-            })
-        } else {
-            None
-        };
         let pane_count = group
             .iter()
             .map(|member| {
@@ -1203,19 +1199,90 @@ impl ClientShellState {
         } else {
             panes
         };
-        self.overlay = Some(ClientShellOverlay::ConfirmClose(
-            ClientConfirmCloseOverlay {
+        let agents = snapshot.agents.iter().filter(|agent| {
+            group
+                .iter()
+                .any(|member| member.workspace_id == agent.workspace_id)
+        });
+        let stopped = agents_stopped_text(agents)
+            .map(|stopped| format!(", {stopped}"))
+            .unwrap_or_default();
+        let detail = format!("{} — {scope}{stopped}", workspace.label);
+        let implied_by = match via {
+            Some(scope) => {
+                let Some(target) = self.scoped_target(scope, &workspace_id) else {
+                    return false;
+                };
+                Some(target)
+            }
+            None => None,
+        };
+        let request = match implied_by {
+            // A workspace's last tab or pane is confirmed here and then closed
+            // as itself, so the server closes the workspace with it.
+            Some(target) if !closes_group => ClientCloseRequest::Scoped(target),
+            // A group close is confirmed here and sent as an explicit group
+            // close rather than the tab or pane close that implied it, which
+            // the server would otherwise ask to confirm again.
+            implied_by => ClientCloseRequest::Workspace {
                 workspace_id,
                 close_group: closes_group,
-                tab_target,
+                implied_by,
+            },
+        };
+        self.overlay = Some(ClientShellOverlay::ConfirmClose(
+            ClientConfirmCloseOverlay {
+                request,
                 title: if closes_group {
                     "Close worktree group?".to_owned()
                 } else {
                     "Close workspace?".to_owned()
                 },
-                detail: format!("{} — {scope}", workspace.label),
+                detail,
             },
         ));
         true
     }
+
+    /// Whether a confirmed tab or pane close still targets the session it was
+    /// requested against; otherwise tells the user to retry.
+    fn close_target_current(&mut self, target: &ClientScopedCloseTarget, unchanged: bool) -> bool {
+        if target.workspace.endpoint_id == self.active_endpoint_id
+            && self.navigation_target_valid(&target.workspace)
+            && unchanged
+        {
+            return true;
+        }
+        self.receive_endpoint_unavailable(format!(
+            "Close target changed; try closing the {} again",
+            target.scope.noun()
+        ));
+        false
+    }
+
+    /// Pins a tab or pane close to the active endpoint's current snapshot.
+    fn scoped_target(
+        &self,
+        scope: ClientCloseScope,
+        workspace_id: &str,
+    ) -> Option<ClientScopedCloseTarget> {
+        let workspace = self.navigation_target(&self.active_endpoint_id, workspace_id)?;
+        Some(ClientScopedCloseTarget { scope, workspace })
+    }
+}
+
+/// Describes the agents a close would stop, or `None` when it stops none.
+fn agents_stopped_text<'a>(
+    agents: impl IntoIterator<Item = &'a crate::protocol::ClientShellAgent>,
+) -> Option<String> {
+    let mut agents = agents.into_iter();
+    let first = agents.next()?;
+    Some(match agents.count() {
+        0 => format!(
+            "stops {} ({})",
+            super::agent_label(first).unwrap_or("agent"),
+            super::status_text(first.agent_status),
+        ),
+        others => format!("stops {} agents", others + 1),
+    })
 }

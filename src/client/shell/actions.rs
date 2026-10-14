@@ -113,11 +113,7 @@ impl ClientShellState {
                     return;
                 }
                 if action == crate::input::KeybindAction::ClosePane {
-                    if let Some(pane_id) = self
-                        .snapshot
-                        .as_deref()
-                        .and_then(|snapshot| snapshot.focused_pane_id.clone())
-                    {
+                    if let Some(pane_id) = self.focused_pane_id() {
                         self.request_pane_close(pane_id, outcome);
                     }
                     return;
