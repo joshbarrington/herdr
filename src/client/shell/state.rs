@@ -568,17 +568,128 @@ pub(super) struct ClientContextMenuItem {
     pub(super) action: ClientContextMenuAction,
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum ClientCloseScope {
+    Tab { tab_id: String },
+    Pane { pane_id: String },
+}
+
+impl ClientCloseScope {
+    pub(super) fn noun(&self) -> &'static str {
+        match self {
+            Self::Tab { .. } => "tab",
+            Self::Pane { .. } => "pane",
+        }
+    }
+
+    /// Whether the pane identified by `pane_id` in `tab_id` closes with this scope.
+    pub(super) fn covers(&self, pane_id: &str, tab_id: &str) -> bool {
+        match self {
+            Self::Tab { tab_id: target } => target == tab_id,
+            Self::Pane { pane_id: target } => target == pane_id,
+        }
+    }
+
+    /// The target's workspace id, tab id and display label, if it is in
+    /// `snapshot`.
+    fn find<'a>(&self, snapshot: &'a ClientShellSnapshot) -> Option<(&'a str, &'a str, &'a str)> {
+        match self {
+            Self::Tab { tab_id } => {
+                snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| &tab.tab_id == tab_id)
+                    .map(|tab| {
+                        (
+                            tab.workspace_id.as_str(),
+                            tab.tab_id.as_str(),
+                            tab.label.as_str(),
+                        )
+                    })
+            }
+            Self::Pane { pane_id } => snapshot
+                .panes
+                .iter()
+                .find(|pane| &pane.pane_id == pane_id)
+                .map(|pane| {
+                    (
+                        pane.workspace_id.as_str(),
+                        pane.tab_id.as_str(),
+                        pane.label.as_deref().unwrap_or("pane"),
+                    )
+                }),
+        }
+    }
+
+    /// The target's workspace id and display label, if it is in `snapshot`.
+    pub(super) fn locate<'a>(
+        &self,
+        snapshot: &'a ClientShellSnapshot,
+    ) -> Option<(&'a str, &'a str)> {
+        self.find(snapshot)
+            .map(|(workspace_id, _, label)| (workspace_id, label))
+    }
+
+    /// The workspace this close would also close, if it removes the
+    /// workspace's last pane. Mirrors the server's rule: a pane closes its
+    /// workspace when it is the only pane in the workspace's only tab.
+    pub(super) fn closed_workspace<'a>(
+        &self,
+        snapshot: &'a ClientShellSnapshot,
+    ) -> Option<&'a str> {
+        let (workspace_id, tab_id, _) = self.find(snapshot)?;
+        if let Self::Pane { pane_id } = self {
+            let tab_has_other_panes = snapshot
+                .panes
+                .iter()
+                .any(|pane| pane.tab_id == tab_id && &pane.pane_id != pane_id);
+            if tab_has_other_panes {
+                return None;
+            }
+        }
+        let workspace_has_other_tabs = snapshot
+            .tabs
+            .iter()
+            .any(|tab| tab.workspace_id == workspace_id && tab.tab_id != tab_id);
+        (!workspace_has_other_tabs).then_some(workspace_id)
+    }
+
+    pub(super) fn into_method(self) -> crate::api::schema::Method {
+        use crate::api::schema::{Method, PaneTarget, TabTarget};
+        match self {
+            Self::Tab { tab_id } => Method::TabClose(TabTarget { tab_id }),
+            Self::Pane { pane_id } => Method::PaneClose(PaneTarget { pane_id }),
+        }
+    }
+}
+
+/// A tab or pane close awaiting confirmation, pinned to the snapshot it was
+/// requested against so a changed session cannot redirect the close.
 #[derive(Debug)]
-pub(super) struct ClientTabCloseConfirmation {
-    pub(super) tab_id: String,
+pub(super) struct ClientScopedCloseTarget {
+    pub(super) scope: ClientCloseScope,
     pub(super) workspace: WorkspaceNavigationTarget,
 }
 
 #[derive(Debug)]
+pub(super) enum ClientCloseRequest {
+    /// Close a workspace, or its whole worktree group. `implied_by` is the
+    /// tab or pane whose close implied a group close; confirming re-checks it,
+    /// and cancelling returns to the prior mode rather than to workspace
+    /// navigation.
+    Workspace {
+        workspace_id: String,
+        close_group: bool,
+        implied_by: Option<ClientScopedCloseTarget>,
+    },
+    /// Close one tab or pane: one running an agent, or a workspace's last
+    /// tab or pane, which closes the workspace with it.
+    Scoped(ClientScopedCloseTarget),
+}
+
+#[derive(Debug)]
 pub(super) struct ClientConfirmCloseOverlay {
-    pub(super) workspace_id: String,
-    pub(super) close_group: bool,
-    pub(super) tab_target: Option<ClientTabCloseConfirmation>,
+    pub(super) request: ClientCloseRequest,
     pub(super) title: String,
     pub(super) detail: String,
 }

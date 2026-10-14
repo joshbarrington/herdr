@@ -278,7 +278,9 @@ fn duplicate_repo_parents_remain_visible_and_focusable_when_collapsed() {
                 assert!(close.actions.is_empty());
                 assert!(matches!(state.overlay.as_ref(),
                     Some(ClientShellOverlay::ConfirmClose(confirm))
-                        if confirm.title == "Close workspace?" && !confirm.close_group));
+                        if confirm.title == "Close workspace?"
+                            && matches!(confirm.request,
+                                ClientCloseRequest::Workspace { close_group: false, .. })));
                 close = state.handle_input_bytes(b"\r");
             }
             assert!(matches!(close.actions.as_slice(),
@@ -1064,7 +1066,7 @@ fn workspace_actions_preserve_selected_target_and_client_confirmation() {
     assert!(matches!(
         state.overlay.as_ref(),
         Some(ClientShellOverlay::ConfirmClose(ClientConfirmCloseOverlay {
-            workspace_id,
+            request: ClientCloseRequest::Workspace { workspace_id, .. },
             ..
         })) if workspace_id == "ws_2"
     ));

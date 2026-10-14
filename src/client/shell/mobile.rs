@@ -647,12 +647,7 @@ fn mobile_items(
                 .tabs
                 .iter()
                 .find(|tab| tab.tab_id == agent.tab_id);
-            let agent_label = agent
-                .display_agent
-                .as_deref()
-                .or(agent.name.as_deref())
-                .or(agent.agent.as_deref())
-                .unwrap_or("agent");
+            let agent_label = super::agent_label(agent).unwrap_or("agent");
             let primary = workspace
                 .map(|workspace| workspace.label.as_str())
                 .unwrap_or(agent_label);

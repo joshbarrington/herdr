@@ -476,7 +476,14 @@ fn new_tab_overlay_owns_text_cursor_and_submits_public_api_request() {
 #[test]
 fn close_confirmation_error_becomes_client_owned_overlay_and_stable_workspace_close() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.set_snapshot(Box::new(snapshot()));
+    // A second tab keeps the pane close from closing the workspace locally, so
+    // the request reaches the server's confirmation path.
+    let mut projected = snapshot();
+    let mut tab = projected.tabs[0].clone();
+    tab.tab_id = "tab_2".into();
+    tab.focused = false;
+    projected.tabs.push(tab);
+    state.set_snapshot(Box::new(projected));
     state.set_pane_surface(surface());
     let mut close = ClientShellInput::default();
     state.record_binding(

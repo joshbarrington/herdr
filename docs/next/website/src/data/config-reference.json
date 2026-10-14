@@ -962,7 +962,7 @@
           "key": "ui.confirm_close",
           "type": "boolean",
           "default": "true",
-          "description": "Ask for confirmation before closing a workspace."
+          "description": "Ask for confirmation before closing a workspace (including via its last tab or pane), or a tab or pane running an agent."
         },
         {
           "key": "ui.prompt_new_tab_name",

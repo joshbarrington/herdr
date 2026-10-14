@@ -211,6 +211,16 @@ fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {
     }
 }
 
+/// An agent's display name, preferring the detected display name over the
+/// user-assigned name and the raw agent id.
+fn agent_label(agent: &crate::protocol::ClientShellAgent) -> Option<&str> {
+    agent
+        .display_agent
+        .as_deref()
+        .or(agent.name.as_deref())
+        .or(agent.agent.as_deref())
+}
+
 fn status_text(status: crate::api::schema::AgentStatus) -> &'static str {
     use crate::api::schema::AgentStatus;
     match status {
