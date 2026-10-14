@@ -216,19 +216,9 @@ fn last_tab_close_preserves_parent_group_and_linked_workspace_scope() {
             ));
             assert_tab_close(&state.handle_input_bytes(b"\r"));
         } else {
-            assert_tab_close(&close);
-            assert!(state.overlay.is_none());
-            let [ClientShellAction::Endpoint { request, .. }] = close.actions.as_slice() else {
-                panic!("tab close request");
-            };
-            state.handle_endpoint_result(
-                "boot-1",
-                &request.id,
-                Err(ClientShellEndpointError {
-                    code: Some("confirmation_required".into()),
-                    message: "closing this tab would close a worktree group".into(),
-                }),
-            );
+            // The parent's last tab closes the whole group: one client-side
+            // prompt, confirmed with an explicit group close.
+            assert_no_close(&close);
             assert!(matches!(state.overlay.as_ref(),
                 Some(ClientShellOverlay::ConfirmClose(confirm)) if confirm.title == "Close worktree group?"));
             let accepted = state.handle_input_bytes(b"\r");
