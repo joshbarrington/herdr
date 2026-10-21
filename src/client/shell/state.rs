@@ -39,6 +39,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) local_keys: crate::config::KeysConfig,
     pub(super) keybinding_source: ClientShellKeybindingSource,
     pub(super) prompt_new_tab_name: bool,
+    pub(super) modal_navigation: bool,
     pub(super) prompt_new_workspace_name: bool,
     pub(super) confirm_close: bool,
     pub(super) mouse_capture: bool,
@@ -59,6 +60,10 @@ pub(super) struct ClientShellLayout {
     pub tab_bar: Rect,
     pub mobile_header: Rect,
     pub pane_surface: Rect,
+    /// Slim status row beneath the panes, shown in navigate mode under modal
+    /// navigation, with a blank padding row above it for an unsplit pane. The
+    /// panes fill its space otherwise.
+    pub mode_bar: Rect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,18 +568,128 @@ pub(super) struct ClientContextMenuItem {
     pub(super) action: ClientContextMenuAction,
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum ClientCloseScope {
+    Tab { tab_id: String },
+    Pane { pane_id: String },
+}
+
+impl ClientCloseScope {
+    pub(super) fn noun(&self) -> &'static str {
+        match self {
+            Self::Tab { .. } => "tab",
+            Self::Pane { .. } => "pane",
+        }
+    }
+
+    /// Whether the pane identified by `pane_id` in `tab_id` closes with this scope.
+    pub(super) fn covers(&self, pane_id: &str, tab_id: &str) -> bool {
+        match self {
+            Self::Tab { tab_id: target } => target == tab_id,
+            Self::Pane { pane_id: target } => target == pane_id,
+        }
+    }
+
+    /// The target's workspace id, tab id and display label, if it is in
+    /// `snapshot`.
+    fn find<'a>(&self, snapshot: &'a ClientShellSnapshot) -> Option<(&'a str, &'a str, &'a str)> {
+        match self {
+            Self::Tab { tab_id } => {
+                snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| &tab.tab_id == tab_id)
+                    .map(|tab| {
+                        (
+                            tab.workspace_id.as_str(),
+                            tab.tab_id.as_str(),
+                            tab.label.as_str(),
+                        )
+                    })
+            }
+            Self::Pane { pane_id } => snapshot
+                .panes
+                .iter()
+                .find(|pane| &pane.pane_id == pane_id)
+                .map(|pane| {
+                    (
+                        pane.workspace_id.as_str(),
+                        pane.tab_id.as_str(),
+                        pane.label.as_deref().unwrap_or("pane"),
+                    )
+                }),
+        }
+    }
+
+    /// The target's workspace id and display label, if it is in `snapshot`.
+    pub(super) fn locate<'a>(
+        &self,
+        snapshot: &'a ClientShellSnapshot,
+    ) -> Option<(&'a str, &'a str)> {
+        self.find(snapshot)
+            .map(|(workspace_id, _, label)| (workspace_id, label))
+    }
+
+    /// The workspace this close would also close, if it removes the
+    /// workspace's last pane. Mirrors the server's rule: a pane closes its
+    /// workspace when it is the only pane in the workspace's only tab.
+    pub(super) fn closed_workspace<'a>(
+        &self,
+        snapshot: &'a ClientShellSnapshot,
+    ) -> Option<&'a str> {
+        let (workspace_id, tab_id, _) = self.find(snapshot)?;
+        if let Self::Pane { pane_id } = self {
+            let tab_has_other_panes = snapshot
+                .panes
+                .iter()
+                .any(|pane| pane.tab_id == tab_id && &pane.pane_id != pane_id);
+            if tab_has_other_panes {
+                return None;
+            }
+        }
+        let workspace_has_other_tabs = snapshot
+            .tabs
+            .iter()
+            .any(|tab| tab.workspace_id == workspace_id && tab.tab_id != tab_id);
+        (!workspace_has_other_tabs).then_some(workspace_id)
+    }
+
+    pub(super) fn into_method(self) -> crate::api::schema::Method {
+        use crate::api::schema::{Method, PaneTarget, TabTarget};
+        match self {
+            Self::Tab { tab_id } => Method::TabClose(TabTarget { tab_id }),
+            Self::Pane { pane_id } => Method::PaneClose(PaneTarget { pane_id }),
+        }
+    }
+}
+
+/// A tab or pane close awaiting confirmation, pinned to the snapshot it was
+/// requested against so a changed session cannot redirect the close.
 #[derive(Debug)]
-pub(super) struct ClientTabCloseConfirmation {
-    pub(super) pane_id: Option<String>,
-    pub(super) tab_id: String,
+pub(super) struct ClientScopedCloseTarget {
+    pub(super) scope: ClientCloseScope,
     pub(super) workspace: WorkspaceNavigationTarget,
 }
 
 #[derive(Debug)]
+pub(super) enum ClientCloseRequest {
+    /// Close a workspace, or its whole worktree group. `implied_by` is the
+    /// tab or pane whose close implied a group close; confirming re-checks it,
+    /// and cancelling returns to the prior mode rather than to workspace
+    /// navigation.
+    Workspace {
+        workspace_id: String,
+        close_group: bool,
+        implied_by: Option<ClientScopedCloseTarget>,
+    },
+    /// Close one tab or pane: one running an agent, or a workspace's last
+    /// tab or pane, which closes the workspace with it.
+    Scoped(ClientScopedCloseTarget),
+}
+
+#[derive(Debug)]
 pub(super) struct ClientConfirmCloseOverlay {
-    pub(super) workspace_id: String,
-    pub(super) close_group: bool,
-    pub(super) tab_target: Option<ClientTabCloseConfirmation>,
+    pub(super) request: ClientCloseRequest,
     pub(super) title: String,
     pub(super) detail: String,
 }
@@ -901,6 +1016,15 @@ pub(crate) struct ClientShellState {
     pub(super) collapsed_endpoints: HashSet<ClientEndpointId>,
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<WorkspaceNavigationTarget>,
+    /// Navigate mode's keyboard focus is on the workspace list rather than a
+    /// pane. Read through `workspace_list_focused()`.
+    pub(super) workspace_list_focus: bool,
+    /// Agent selected in the agents panel while workspace-list focus has moved
+    /// down into it. Read through `agent_list_focused()`.
+    pub(super) agent_list_selection: Option<(ClientEndpointId, String)>,
+    /// Under modal navigation, whether input rests in navigate (normal) mode
+    /// rather than the terminal (insert). Transient modes return to it.
+    pub(super) resting_in_navigate: bool,
     pub(super) pending_workspace_highlight: Option<PendingWorkspaceHighlight>,
     pub(super) reveal_navigation_workspace: bool,
     pub(super) overlay: Option<ClientShellOverlay>,
@@ -996,6 +1120,7 @@ impl ClientShellState {
     pub(crate) fn new(mut config: ClientShellConfig) -> Self {
         let preferences = config.preferences.clone();
         let local_config_diagnostic = config.startup_config_diagnostic.take();
+        let resting_in_navigate = config.modal_navigation;
         let overlay = config
             .startup_onboarding
             .then_some(ClientShellOverlay::Onboarding);
@@ -1073,8 +1198,15 @@ impl ClientShellState {
             endpoints: vec![local_endpoint()],
             active_endpoint_id: ClientEndpointId::Local,
             collapsed_endpoints: HashSet::new(),
-            mode: ClientShellMode::Terminal,
+            mode: if resting_in_navigate {
+                ClientShellMode::Navigate
+            } else {
+                ClientShellMode::Terminal
+            },
             navigate_workspace_id: None,
+            workspace_list_focus: false,
+            agent_list_selection: None,
+            resting_in_navigate,
             pending_workspace_highlight: None,
             reveal_navigation_workspace: false,
             overlay,
@@ -1141,7 +1273,7 @@ impl ClientShellState {
             .and_then(|snapshot| snapshot.focused_workspace_id.as_ref())
             .is_some()
         {
-            self.mode = self.copy_or_terminal_mode();
+            self.mode = self.resting_mode();
             self.navigate_workspace_id = None;
         } else {
             self.mode = ClientShellMode::Navigate;
@@ -1225,6 +1357,7 @@ impl ClientShellState {
             self.sidebar_collapsed,
             self.focused_tab_count(),
             self.sidebar_width,
+            self.mode_bar_rows(),
         )
     }
 
@@ -1287,13 +1420,30 @@ impl ClientShellState {
         self.word_selection_gesture = None;
         self.copy_mode = None;
         if self.mode == ClientShellMode::Copy {
-            self.mode = ClientShellMode::Terminal;
+            self.mode = self.base_mode();
         }
         self.reset_copy_pipeline();
         self.copy_feedback = None;
         self.copy_feedback_deadline = None;
         self.host_mouse_pixels = None;
         self.dismissed_product_announcement = None;
+    }
+
+    /// Resting modal navigation follows workspace focus: a highlight on the
+    /// focused workspace is reseeded when `next` moves focus elsewhere, while
+    /// an explicit preview (the highlight moved off focus) is kept.
+    fn highlight_follows_focus_to(&self, next: &ClientShellSnapshot) -> bool {
+        let focused = self
+            .snapshot
+            .as_deref()
+            .and_then(|current| current.focused_workspace_id.as_deref());
+        self.resting_navigate()
+            && !self.workspace_list_focused()
+            && next.focused_workspace_id.as_deref() != focused
+            && self.navigate_workspace_id.as_ref().is_some_and(|target| {
+                target.endpoint_id == self.active_endpoint_id
+                    && Some(target.workspace_id.as_str()) == focused
+            })
     }
 
     pub(super) fn apply_active_snapshot(
@@ -1405,7 +1555,9 @@ impl ClientShellState {
                     ClientShellMode::Prefix | ClientShellMode::Navigate | ClientShellMode::Resize
                 )
             {
-                self.mode = ClientShellMode::Terminal;
+                self.mode = self.base_mode();
+                self.navigate_workspace_id = None;
+                self.workspace_list_focus = false;
             }
         }
         let tab_layout_changed = self.snapshot.as_deref().is_none_or(|current| {
@@ -1490,7 +1642,7 @@ impl ClientShellState {
                     self.selection_highlight_clear_deadline = None;
                 }
                 if self.mode == ClientShellMode::Copy {
-                    self.mode = ClientShellMode::Terminal;
+                    self.mode = self.base_mode();
                 }
             } else if pane_focused {
                 if self.mode == ClientShellMode::Terminal {
@@ -1510,9 +1662,12 @@ impl ClientShellState {
                     self.selection_highlight_clear_deadline = None;
                 }
                 if self.mode == ClientShellMode::Copy {
-                    self.mode = ClientShellMode::Terminal;
+                    self.mode = self.base_mode();
                 }
             }
+        }
+        if self.highlight_follows_focus_to(&snapshot) {
+            self.navigate_workspace_id = None;
         }
         if self.mode == ClientShellMode::Navigate && self.navigate_workspace_id.is_none() {
             self.navigate_workspace_id = snapshot
@@ -1676,7 +1831,7 @@ impl ClientShellState {
                 self.input_leases
                     .remove_target(&ClientInputTarget::Popup(terminal_id.clone()));
             }
-            self.mode = ClientShellMode::Terminal;
+            self.mode = self.base_mode();
             self.navigate_workspace_id = None;
             if !matches!(
                 self.overlay.as_ref(),

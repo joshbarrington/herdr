@@ -113,11 +113,7 @@ impl ClientShellState {
                     return;
                 }
                 if action == crate::input::KeybindAction::ClosePane {
-                    if let Some(pane_id) = self
-                        .snapshot
-                        .as_deref()
-                        .and_then(|snapshot| snapshot.focused_pane_id.clone())
-                    {
+                    if let Some(pane_id) = self.focused_pane_id() {
                         self.request_pane_close(pane_id, outcome);
                     }
                     return;
@@ -152,6 +148,9 @@ impl ClientShellState {
                     self.pending_workspace_highlight = None;
                     self.mobile_switcher_scroll = 0;
                     self.reveal_mobile_workspace = false;
+                    // Resting modal navigation picks workspaces from the list.
+                    self.workspace_list_focus = self.base_mode() == ClientShellMode::Navigate;
+                    self.agent_list_selection = None;
                     self.mode = ClientShellMode::Navigate;
                     self.navigate_workspace_id = self.focused_navigation_target();
                     self.reveal_navigation_workspace = true;

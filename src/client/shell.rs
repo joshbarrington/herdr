@@ -211,6 +211,16 @@ fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {
     }
 }
 
+/// An agent's display name, preferring the detected display name over the
+/// user-assigned name and the raw agent id.
+fn agent_label(agent: &crate::protocol::ClientShellAgent) -> Option<&str> {
+    agent
+        .display_agent
+        .as_deref()
+        .or(agent.name.as_deref())
+        .or(agent.agent.as_deref())
+}
+
 fn status_text(status: crate::api::schema::AgentStatus) -> &'static str {
     use crate::api::schema::AgentStatus;
     match status {
@@ -240,6 +250,28 @@ fn panel_contrast_fg(palette: &Palette) -> ratatui::style::Color {
     match palette.panel_bg {
         ratatui::style::Color::Reset => palette.surface_dim,
         color => color,
+    }
+}
+
+/// Recolors the focused pane's accent border, including the split lines it
+/// shares on its right and bottom, to `dim`.
+fn dim_pane_border(frame: &mut FrameData, pane: &PaneHit, accent: u32, dim: u32) {
+    let (rect, inner) = (pane.rect, pane.inner_rect);
+    for y in rect.y..=rect.bottom().min(frame.height.saturating_sub(1)) {
+        // Rows beside the content only have border cells at their ends.
+        let (gap_start, gap_end) = if (inner.y..inner.bottom()).contains(&y) {
+            (inner.x, inner.right())
+        } else {
+            (rect.x, rect.x)
+        };
+        for x in
+            (rect.x..gap_start).chain(gap_end..=rect.right().min(frame.width.saturating_sub(1)))
+        {
+            let index = usize::from(y) * usize::from(frame.width) + usize::from(x);
+            if let Some(cell) = frame.cells.get_mut(index).filter(|cell| cell.fg == accent) {
+                cell.fg = dim;
+            }
+        }
     }
 }
 
